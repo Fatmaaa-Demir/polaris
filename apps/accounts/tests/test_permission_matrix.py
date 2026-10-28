@@ -1,0 +1,168 @@
+"""The permission matrix (spec §3.3 table, §3.4 rule 5).
+
+Every URL in the project × every persona is REALLY requested through the Django test
+client, and the status code is compared with the expectation. Nothing here checks only
+the shape of the table.
+
+    302  anonymous user → redirected to the login page
+    200  allowed
+    404  not allowed, or the object is not yours (a 403 would reveal it exists)
+    403  you can see it but may not change it (offering in a closed term)
+
+A URL that is in the URLconf but not in ROWS fails `test_every_url_is_in_the_matrix`.
+
+HOW TO ADD A URL (do this in the same PR that adds the URL):
+
+    # an offering page, decorated @require_offering_access()
+    Row("catalog:offering", "GET", READ_OFFERING, offering_kwargs("open_offering"), "open"),
+    Row("catalog:offering", "GET", READ_OFFERING, offering_kwargs("closed_offering"), "closed"),
+
+    # a write on an offering, decorated @require_offering_access(edit=True)
+    Row("outcomes:lo_create", "POST", WRITE_OPEN, offering_kwargs("open_offering"), "open term"),
+    Row(
+    "outcomes:lo_create",
+    "POST",
+    WRITE_CLOSED,
+    offering_kwargs("closed_offering"),
+    "closed term",
+),
+
+    # a department page, decorated @require_role("head")
+    Row("reports:department", "GET", DEPARTMENT),
+
+Pick the expectation table from permission_world.py, or write a literal dict if the page
+has its own rule. Every persona must be listed.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
+import pytest
+from django.conf import settings
+from django.shortcuts import resolve_url
+from django.test import Client
+from django.urls import URLPattern, URLResolver, get_resolver, reverse
+
+from apps.accounts.tests.permission_world import (
+    PERSONAS,
+    PUBLIC,
+    World,
+    build_world,
+)
+
+# Not ours: Django's admin has its own staff-only login (tested separately below), and
+# the debug toolbar only exists in DEBUG.
+EXTERNAL_PREFIXES = ("admin:", "djdt:")
+
+
+def _no_kwargs(world: World) -> dict:
+    return {}
+
+
+def offering_kwargs(attr: str) -> Callable[[World], dict]:
+    """URL kwargs for a page about one of the world's offerings."""
+    return lambda world: {"offering_id": getattr(world, attr).pk}
+
+
+@dataclass(frozen=True)
+class Row:
+    name: str  # namespaced URL name, e.g. "catalog:offering"
+    method: str  # "GET" or "POST"
+    expect: dict  # persona → expected status code
+    kwargs: Callable[[World], dict] = _no_kwargs
+    scenario: str = ""  # shown in the test id, e.g. "closed term"
+
+    @property
+    def id(self) -> str:
+        return f"{self.name}[{self.scenario}]" if self.scenario else self.name
+
+
+ROWS: list[Row] = [
+    Row("healthz", "GET", PUBLIC),
+]
+
+
+# --------------------------------------------------------------------------- the matrix
+
+
+@pytest.fixture
+def world(db) -> World:
+    return build_world()
+
+
+@pytest.mark.parametrize("persona", PERSONAS)
+@pytest.mark.parametrize("row", ROWS, ids=lambda r: r.id)
+def test_url_role_matrix(world, row, persona):
+    client = Client()
+    user = world.users[persona]
+    if user is not None:
+        client.force_login(user)
+
+    url = reverse(row.name, kwargs=row.kwargs(world))
+    response = getattr(client, row.method.lower())(url)
+
+    expected = row.expect[persona]
+    assert response.status_code == expected, (
+        f"{row.method} {url} as {persona}: expected {expected}, got {response.status_code}"
+    )
+    if expected == 302 and persona == "anonymous":
+        assert response["Location"].startswith(resolve_url(settings.LOGIN_URL)), (
+            f"{url}: anonymous users must be sent to the login page"
+        )
+
+
+# --------------------------------------------------------------- the matrix stays complete
+
+
+def iter_url_names(patterns, namespace=""):
+    """Every route in the URLconf as a namespaced name. Unnamed routes get a marker."""
+    for pattern in patterns:
+        if isinstance(pattern, URLResolver):
+            inner = f"{namespace}{pattern.namespace}:" if pattern.namespace else namespace
+            yield from iter_url_names(pattern.url_patterns, inner)
+        elif isinstance(pattern, URLPattern):
+            yield (
+                f"{namespace}{pattern.name}"
+                if pattern.name
+                else f"{namespace}<unnamed: {pattern.pattern}>"
+            )
+
+
+def project_url_names() -> set[str]:
+    names = set(iter_url_names(get_resolver().url_patterns))
+    return {n for n in names if not n.startswith(EXTERNAL_PREFIXES)}
+
+
+def test_every_url_is_in_the_matrix():
+    missing = project_url_names() - {row.name for row in ROWS}
+    assert not missing, (
+        "These URLs are not in the permission matrix. Add a Row for each one in "
+        f"apps/accounts/tests/test_permission_matrix.py (unnamed routes need a name first): "
+        f"{sorted(missing)}"
+    )
+
+
+def test_matrix_has_no_stale_rows():
+    stale = {row.name for row in ROWS} - project_url_names()
+    assert not stale, f"Rows for URLs that no longer exist: {sorted(stale)}"
+
+
+@pytest.mark.parametrize("row", ROWS, ids=lambda r: r.id)
+def test_every_row_covers_every_persona(row):
+    assert set(row.expect) == set(PERSONAS)
+
+
+# ------------------------------------------------------------------------ Django's admin
+
+
+@pytest.mark.parametrize(
+    ("persona", "expected"),
+    [("anonymous", 302), ("student", 302), ("head", 302), ("admin", 200)],
+)
+def test_django_admin_is_staff_only(world, persona, expected):
+    client = Client()
+    if world.users[persona] is not None:
+        client.force_login(world.users[persona])
+    assert client.get(reverse("admin:index")).status_code == expected
